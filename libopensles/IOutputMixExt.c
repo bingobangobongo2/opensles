@@ -31,6 +31,23 @@ typedef struct {
 } stereo;
 
 
+/** \brief Cast float to int32 with clamping to int16 range (for gain application before accumulation) */
+
+static inline int32_t gain_to_i32(float f) {
+    if (f > 32767.0f) return 32767;
+    if (f < -32768.0f) return -32768;
+    return (int32_t)f;
+}
+
+/** \brief Clamp int32 to int16 range */
+
+static inline short clamp_s16(int32_t v) {
+    if (v > 32767) v = 32767;
+    if (v < -32768) v = -32768;
+    return (short)v;
+}
+
+
 /** \brief Summary of the gain, as an optimization for the mixer */
 
 typedef enum {
@@ -70,6 +87,20 @@ static SLboolean track_check(Track *track)
         if (audioPlayer->mBufferQueue.mClearRequested) {
             // application thread(s) that call BufferQueue::Clear while mixer is active
             // will block synchronously until mixer acknowledges the Clear request
+            // Free all queued buffers before clearing
+            {
+                const BufferHeader *cf = audioPlayer->mBufferQueue.mFront;
+                const BufferHeader *cr = audioPlayer->mBufferQueue.mRear;
+                while (cf != cr) {
+                    if (cf->mBuffer != NULL) {
+                        free((void *)cf->mBuffer);
+                        ((BufferHeader *)cf)->mBuffer = NULL;
+                    }
+                    if (++cf == &audioPlayer->mBufferQueue.mArray[audioPlayer->mBufferQueue.mNumBuffers + 1]) {
+                        cf = audioPlayer->mBufferQueue.mArray;
+                    }
+                }
+            }
             audioPlayer->mBufferQueue.mFront = &audioPlayer->mBufferQueue.mArray[0];
             audioPlayer->mBufferQueue.mRear = &audioPlayer->mBufferQueue.mArray[0];
             audioPlayer->mBufferQueue.mState.count = 0;
@@ -99,6 +130,21 @@ static SLboolean track_check(Track *track)
         switch (audioPlayer->mPlay.mState) {
 
         case SL_PLAYSTATE_PLAYING:  // continue playing current track data
+            // Always copy gains so distance attenuation updates (via
+            // SetVolumeLevel → audioPlayerGainUpdate) reach the mixer
+            // even while a buffer is being consumed.  Without this,
+            // short SFX plays at whatever gain was set at dequeue time,
+            // ignoring later distance-based volume changes.
+            track->mGains[0] = audioPlayer->mGains[0];
+            track->mGains[1] = audioPlayer->mGains[1];
+            // SFX (non-SndFile) tracks get -26dB reduction.
+            // At 0.1f (-20dB), 10 NPC footsteps summed to ~music volume.
+            // 0.05f gives more headroom for many simultaneous SFX.
+            if (audioPlayer->mSndFile.mSNDFILE == NULL) {
+                track->mGains[0] *= 0.05f;
+                track->mGains[1] *= 0.05f;
+            }
+
             if (0 < track->mAvail) {
                 trackHasData = SL_BOOLEAN_TRUE;
                 break;
@@ -114,17 +160,24 @@ static SLboolean track_check(Track *track)
                 audioPlayer->mPlay.mState = SL_PLAYSTATE_PLAYING;
                 trackHasData = SL_BOOLEAN_TRUE;
             } else {
-                // no buffers on queue, so playable but not playing
-                // NTH should be able to call a desperation callback when completely starved,
-                // or call less often than every buffer based on high/low water-marks
-#ifdef SYBERIA
-				audioPlayer->mPlay.mState = SL_PLAYSTATE_STOPPING;
-#endif
+                // No buffers on queue — fire HEAD_AT_END callback for SFX
+                // (non-SndFile) players so the game's voice lifecycle can
+                // release the AudioPlayer slot for reuse.
+                if (audioPlayer->mSndFile.mSNDFILE == NULL) {
+                    if (audioPlayer->mPlay.mEventFlags & SL_PLAYEVENT_HEADATEND) {
+                        slPlayCallback cb = audioPlayer->mPlay.mCallback;
+                        void *ctx = audioPlayer->mPlay.mContext;
+                        // Clear event flags so callback fires only once
+                        audioPlayer->mPlay.mEventFlags = 0;
+                        if (NULL != cb) {
+                            // Unlock before callback to avoid deadlock with game thread
+                            object_unlock_exclusive(&audioPlayer->mObject);
+                            (*cb)(&audioPlayer->mPlay.mItf, ctx, SL_PLAYEVENT_HEADATEND);
+                            object_lock_exclusive(&audioPlayer->mObject);
+                        }
+                    }
+                }
             }
-
-            // copy gains from audio player to track
-            track->mGains[0] = audioPlayer->mGains[0];
-            track->mGains[1] = audioPlayer->mGains[1];
             break;
 
         case SL_PLAYSTATE_STOPPING: // application thread(s) called Play::SetPlayState(STOPPED)
@@ -167,7 +220,13 @@ broadcast:
 }
 
 
-/** \brief This is the track mixer: fill the specified 16-bit stereo PCM buffer */
+/** \brief This is the track mixer: fill the specified 16-bit stereo PCM buffer.
+ *
+ *  Uses int32 accumulators to avoid per-track saturation distortion.
+ *  All tracks are summed in 32-bit, then clamped to int16 once at the end.
+ *  This prevents the harsh clipping artifacts that occur when many
+ *  simultaneous tracks (e.g. NPC footsteps) are saturate-added pairwise.
+ */
 
 void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 size)
 {
@@ -175,7 +234,13 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
 
     // Force to be a multiple of a frame, assumes stereo 16-bit PCM
     size &= ~3;
-    SLboolean mixBufferHasData = SL_BOOLEAN_FALSE;
+    SLuint32 numSamples = size / sizeof(short);
+
+    // Int32 accumulator — all tracks sum here, single final clamp to int16
+    int32_t accum[SndFile_BUFSIZE / sizeof(short)];
+    memset(accum, 0, numSamples * sizeof(int32_t));
+
+    SLboolean anyTrackContributed = SL_BOOLEAN_FALSE;
     IOutputMixExt *this = (IOutputMixExt *) self;
     IObject *thisObject = this->mThis;
     // This lock should never block, except when the application destroys the output mix object
@@ -209,25 +274,14 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
         }
 
         // track is playing
-        void *dstWriter = pBuffer;
+        unsigned dstOffset = 0;  // byte offset into accumulator
         unsigned desired = size;
         SLboolean trackContributedToMix = SL_BOOLEAN_FALSE;
-        float gains[STEREO_CHANNELS];
-        Summary summaries[STEREO_CHANNELS];
-        unsigned channel;
-        for (channel = 0; channel < STEREO_CHANNELS; ++channel) {
-            float gain = track->mGains[channel];
-            gains[channel] = gain;
-            Summary summary;
-            if (gain <= 0.001) {
-                summary = GAIN_MUTE;
-            } else if (gain >= 0.999) {
-                summary = GAIN_UNITY;
-            } else {
-                summary = GAIN_OTHER;
-            }
-            summaries[channel] = summary;
-        }
+        float gainL = track->mGains[0];
+        float gainR = track->mGains[1];
+        SLboolean isMuted = (gainL <= 0.001f && gainR <= 0.001f);
+        SLboolean isUnity = (gainL >= 0.999f && gainR >= 0.999f);
+
         while (desired > 0) {
             unsigned actual = desired;
             if (track->mAvail < actual) {
@@ -236,39 +290,26 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
             // force actual to be a frame multiple
             if (actual > 0) {
                 assert(NULL != track->mReader);
-                stereo *mixBuffer = (stereo *) dstWriter;
-                const stereo *source = (const stereo *) track->mReader;
-                unsigned j;
-                if (GAIN_MUTE != summaries[0] || GAIN_MUTE != summaries[1]) {
-                    if (mixBufferHasData) {
-                        // apply gain during add
-                        if (GAIN_UNITY != summaries[0] || GAIN_UNITY != summaries[1]) {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left += (short) (source->left * track->mGains[0]);
-                                mixBuffer->right += (short) (source->right * track->mGains[1]);
-                            }
-                        // no gain adjustment needed, so do a simple add
-                        } else {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left += source->left;
-                                mixBuffer->right += source->right;
-                            }
+                if (!isMuted) {
+                    int32_t *acc = accum + (dstOffset / sizeof(short));
+                    const stereo *source = (const stereo *) track->mReader;
+                    unsigned j;
+                    if (isUnity) {
+                        // No gain adjustment — add raw samples to accumulator
+                        for (j = 0; j < actual; j += sizeof(stereo), acc += 2, ++source) {
+                            acc[0] += (int32_t)source->left;
+                            acc[1] += (int32_t)source->right;
                         }
                     } else {
-                        // apply gain during copy
-                        if (GAIN_UNITY != summaries[0] || GAIN_UNITY != summaries[1]) {
-                            for (j = 0; j < actual; j += sizeof(stereo), ++mixBuffer, ++source) {
-                                mixBuffer->left = (short) (source->left * track->mGains[0]);
-                                mixBuffer->right = (short) (source->right * track->mGains[1]);
-                            }
-                        // no gain adjustment needed, so do a simple copy
-                        } else {
-                            memcpy(dstWriter, track->mReader, actual);
+                        // Apply per-channel gain, then add to accumulator
+                        for (j = 0; j < actual; j += sizeof(stereo), acc += 2, ++source) {
+                            acc[0] += gain_to_i32(source->left * gainL);
+                            acc[1] += gain_to_i32(source->right * gainR);
                         }
                     }
                     trackContributedToMix = SL_BOOLEAN_TRUE;
                 }
-                dstWriter = (char *) dstWriter + actual;
+                dstOffset += actual;
                 desired -= actual;
                 track->mReader = (char *) track->mReader + actual;
                 track->mAvail -= actual;
@@ -285,6 +326,11 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
                         newFront = bufferQueue->mArray;
                     }
                     bufferQueue->mFront = (BufferHeader *) newFront;
+                    // Free the consumed buffer (allocated by Enqueue)
+                    if (oldFront->mBuffer != NULL) {
+                        free((void *)oldFront->mBuffer);
+                        ((BufferHeader *)oldFront)->mBuffer = NULL;
+                    }
                     assert(0 < bufferQueue->mState.count);
                     --bufferQueue->mState.count;
                     if (newFront != rear) {
@@ -315,19 +361,24 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
             if (track_check(track)) {
                 continue;
             }
-            // underflow: clear out rest of partial buffer (NTH synthesize comfort noise)
-            if (!mixBufferHasData && trackContributedToMix) {
-                memset(dstWriter, 0, actual);
-            }
+            // underflow: accumulator is already zeroed, nothing to do
             break;
         }
         if (trackContributedToMix) {
-            mixBufferHasData = SL_BOOLEAN_TRUE;
+            anyTrackContributed = SL_BOOLEAN_TRUE;
         }
     }
     object_unlock_exclusive(thisObject);
-    // No active tracks, so output silence
-    if (!mixBufferHasData) {
+
+    // Final clamp: int32 accumulator → int16 output buffer
+    if (anyTrackContributed) {
+        short *out = (short *)pBuffer;
+        SLuint32 i;
+        for (i = 0; i < numSamples; ++i) {
+            out[i] = clamp_s16(accum[i]);
+        }
+    } else {
+        // No active tracks, output silence
         memset(pBuffer, 0, size);
     }
 

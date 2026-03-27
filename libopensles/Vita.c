@@ -31,7 +31,8 @@ static int audioThread(unsigned int args, void* arg) {
 	int ch = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, SndFile_BUFSIZE / 4, &_opensles_user_freq != NULL ? _opensles_user_freq : 44100, SCE_AUDIO_OUT_MODE_STEREO);
 	sceAudioOutSetConfig(ch, -1, -1, (SceAudioOutMode)-1);
 	
-	int vol_stereo[] = {32767, 32767};
+	// -3dB headroom to reduce clipping on loud simultaneous sounds
+	int vol_stereo[] = {23170, 23170};
 	sceAudioOutSetVolume(ch, (SceAudioOutChannelFlag)(SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH), vol_stereo);
 	
 	int buf_idx = 0;

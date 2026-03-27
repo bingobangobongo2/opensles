@@ -97,6 +97,10 @@ typedef struct COutputMix_struct COutputMix;
 #include "android_AudioRecorder.h"
 #endif
 
+#ifdef LSWTCS
+#include <psp2/types.h>
+#endif
+
 #define STEREO_CHANNELS 2
 
 #ifdef USE_OUTPUTMIXEXT
@@ -220,8 +224,8 @@ typedef struct {
 
 #ifdef USE_SNDFILE
 
-#define SndFile_BUFSIZE 512     // in 16-bit samples
-#define SndFile_NUMBUFS 2
+#define SndFile_BUFSIZE 512     // output buffer size in bytes (also SndFile read size in shorts)
+#define SndFile_NUMBUFS 2       // number of output/SndFile double-buffers
 
 struct SndFile {
     // save URI also?
@@ -724,6 +728,9 @@ typedef struct Play_interface {
     SLmillisecond mLastSeekPosition;     // Last known accurate position, set at Seek
     SLuint32 mFramesSinceLastSeek;       // Frames mixed since last known accurate position
     SLuint32 mFramesSincePositionUpdate; // Frames mixed since last position update callback
+#endif
+#ifdef LSWTCS
+    SceUInt32 mLastTick;
 #endif
 } IPlay;
 

@@ -117,6 +117,7 @@ SLboolean SndFile_IsSupported(const SF_INFO *sfinfo)
     case 11025:
     case 22050:
     case 44100:
+    case 48000:
         break;
     default:
         return SL_BOOLEAN_FALSE;

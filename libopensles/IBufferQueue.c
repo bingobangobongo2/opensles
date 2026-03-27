@@ -42,17 +42,13 @@ static SLuint32 getAssociatedState(IBufferQueue *this)
     return state;
 }
 
-#define NUM_BUFFERS 32
-void *avail_buffers[NUM_BUFFERS] = {NULL};
-int avail_buffers_idx = 0;
-
 SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 size)
 {
     SL_ENTER_INTERFACE
     //SL_LOGV("IBufferQueue_Enqueue(%p, %p, %lu)", self, pBuffer, size);
 
     // Note that Enqueue while a Clear is pending is equivalent to Enqueue followed by Clear
-    
+
     if (NULL == pBuffer || 0 == size) {
         result = SL_RESULT_PARAMETER_INVALID;
     } else {
@@ -65,30 +61,45 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
         if (newRear == this->mFront) {
             result = SL_RESULT_BUFFER_INSUFFICIENT;
         } else {
-            int num_cycles = (&_opensles_user_freq!=NULL?_opensles_user_freq:44100) * 1000 / this->samplerate;
+            int num_cycles = 1;
             int multiplier = 1;
-            if (this->channels == 1)
-                multiplier *= 2;
-            if (this->bps == 8)
-                multiplier *= 2;
-            if (num_cycles != 1 || this->channels == 1 || this->bps == 8) {
-                if (avail_buffers[avail_buffers_idx])
-                    free(avail_buffers[avail_buffers_idx]);
-                avail_buffers[avail_buffers_idx] = calloc(1, size * num_cycles * multiplier);
-                if (this->bps != 8) {
+            if (this->samplerate > 0) {
+                num_cycles = (&_opensles_user_freq!=NULL?_opensles_user_freq:44100) * 1000 / this->samplerate;
+                if (num_cycles < 1) num_cycles = 1;
+                if (this->channels == 1)
+                    multiplier *= 2;
+                if (this->bps == 8)
+                    multiplier *= 2;
+            }
+
+            SLuint32 totalSize = size * num_cycles * multiplier;
+            void *copiedBuffer = calloc(1, totalSize);
+            if (copiedBuffer == NULL) {
+                result = SL_RESULT_MEMORY_FAILURE;
+            } else {
+                // Always copy into our own buffer to avoid race conditions
+                // with the mixer thread reading while the caller frees/reuses.
+                if (this->samplerate == 0) {
+                    // SndFile source: already in correct format, just copy
+                    memcpy(copiedBuffer, pBuffer, size);
+                } else if (this->bps != 8) {
                     if (this->channels == 2) { // PCM16 Stereo
-                        uint32_t *src = (uint32_t *)pBuffer;
-                        uint32_t *dst = (uint32_t *)avail_buffers[avail_buffers_idx];
-                        for (int j = 0; j < size; j += 4) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i] = *src;
+                        if (num_cycles == 1) {
+                            memcpy(copiedBuffer, pBuffer, size);
+                        } else {
+                            uint32_t *src = (uint32_t *)pBuffer;
+                            uint32_t *dst = (uint32_t *)copiedBuffer;
+                            for (int j = 0; j < size; j += 4) {
+                                for (int i = 0; i < num_cycles; i++) {
+                                    dst[i] = *src;
+                                }
+                                src++;
+                                dst += num_cycles;
                             }
-                            src++;
-                            dst += num_cycles;
                         }
-                    } else { // PCM16 Mono
+                    } else { // PCM16 Mono -> Stereo
                         uint16_t *src = (uint16_t *)pBuffer;
-                        uint16_t *dst = (uint16_t *)avail_buffers[avail_buffers_idx];
+                        uint16_t *dst = (uint16_t *)copiedBuffer;
                         for (int j = 0; j < size; j += 2) {
                             for (int i = 0; i < num_cycles; i++) {
                                 dst[i*2] = *src;
@@ -99,9 +110,9 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                         }
                     }
                 } else {
-                    if (this->channels == 2) { // PCM8 Stereo
+                    if (this->channels == 2) { // PCM8 Stereo -> PCM16 Stereo
                         uint8_t *src = (uint8_t *)pBuffer;
-                        int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
+                        int16_t *dst = (int16_t *)copiedBuffer;
                         for (int j = 0; j < size; j += 2) {
                             for (int i = 0; i < num_cycles; i++) {
                                 dst[i*2] = ((int16_t)src[0] - 0x80) << 8;
@@ -110,9 +121,9 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                             src += 2;
                             dst += num_cycles * 2;
                         }
-                    } else { // PCM8 Mono
+                    } else { // PCM8 Mono -> PCM16 Stereo
                         uint8_t *src = (uint8_t *)pBuffer;
-                        int16_t *dst = (int16_t *)avail_buffers[avail_buffers_idx];
+                        int16_t *dst = (int16_t *)copiedBuffer;
                         for (int j = 0; j < size; j++) {
                             for (int i = 0; i < num_cycles; i++) {
                                 dst[i*2] = ((int16_t)*src - 0x80) << 8;
@@ -123,14 +134,13 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
                         }
                     }
                 }
-                pBuffer = avail_buffers[avail_buffers_idx];
-                avail_buffers_idx = (avail_buffers_idx + 1) % NUM_BUFFERS;
+
+                oldRear->mBuffer = copiedBuffer;
+                oldRear->mSize = totalSize;
+                this->mRear = newRear;
+                ++this->mState.count;
+                result = SL_RESULT_SUCCESS;
             }
-            oldRear->mBuffer = pBuffer;
-            oldRear->mSize = size * num_cycles * multiplier;
-            this->mRear = newRear;
-            ++this->mState.count;
-            result = SL_RESULT_SUCCESS;
         }
         // set enqueue attribute if state is PLAYING and the first buffer is enqueued
         interface_unlock_exclusive_attributes(this, ((SL_RESULT_SUCCESS == result) &&
@@ -266,6 +276,20 @@ void IBufferQueue_init(void *self)
 
 void IBufferQueue_Destroy(IBufferQueue *this)
 {
+    // Free any remaining queued buffers (allocated by Enqueue)
+    if (NULL != this->mArray) {
+        const BufferHeader *f = this->mFront;
+        const BufferHeader *r = this->mRear;
+        while (f != NULL && r != NULL && f != r) {
+            if (f->mBuffer != NULL) {
+                free((void *)f->mBuffer);
+                ((BufferHeader *)f)->mBuffer = NULL;
+            }
+            if (++f == &this->mArray[this->mNumBuffers + 1]) {
+                f = this->mArray;
+            }
+        }
+    }
     if ((NULL != this->mArray) && (this->mArray != this->mTypical)) {
         free(this->mArray);
         this->mArray = NULL;

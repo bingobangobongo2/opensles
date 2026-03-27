@@ -16,6 +16,8 @@
 
 /* Play implementation */
 
+#include <psp2/kernel/processmgr.h>
+
 #include "sles_allinclusive.h"
 
 
@@ -51,6 +53,9 @@ static SLresult IPlay_SetPlayState(SLPlayItf self, SLuint32 state)
             case (SL_PLAYSTATE_STOPPED  << 2) | SL_PLAYSTATE_PLAYING:
             case (SL_PLAYSTATE_PAUSED   << 2) | SL_PLAYSTATE_PLAYING:
                 attr = ATTR_TRANSPORT;
+#ifdef LSWTCS
+                this->mLastTick = sceKernelGetProcessTimeLow();
+#endif
                 // set enqueue attribute if queue is non-empty and state becomes PLAYING
                 if ((NULL != audioPlayer) && (audioPlayer->mBufferQueue.mFront !=
                     audioPlayer->mBufferQueue.mRear)) {
@@ -58,8 +63,11 @@ static SLresult IPlay_SetPlayState(SLPlayItf self, SLuint32 state)
                 }
                 // fall through
 
-            case (SL_PLAYSTATE_STOPPED  << 2) | SL_PLAYSTATE_PAUSED:
             case (SL_PLAYSTATE_PLAYING  << 2) | SL_PLAYSTATE_PAUSED:
+#ifdef LSWTCS
+                this->mPosition = sceKernelGetProcessTimeLow() - this->mLastTick;
+#endif
+            case (SL_PLAYSTATE_STOPPED  << 2) | SL_PLAYSTATE_PAUSED:
                 // easy
                 this->mState = state;
                 break;
@@ -194,20 +202,34 @@ static SLresult IPlay_GetPosition(SLPlayItf self, SLmillisecond *pMsec)
             position = this->mPosition;
         }
 #else
+#ifdef LSWTCS
+        if (SL_PLAYSTATE_PLAYING == this->mState) {
+            const SceUInt32 tick = sceKernelGetProcessTimeLow();
+            this->mPosition += tick - this->mLastTick;
+            this->mLastTick = tick;
+        }
+        position = this->mPosition / 1000;
+#else
         // on other platforms we depend on periodic updates to the current position
         position = this->mPosition;
+#endif
+        //SL_LOGV("POSITION %lu", position);
         // if a seek is pending, then lie about current position so the seek appears synchronous
         if (SL_OBJECTID_AUDIOPLAYER == InterfaceToObjectID(this)) {
+            //SL_LOGV("SEEK");
             CAudioPlayer *audioPlayer = (CAudioPlayer *) this->mThis;
             SLmillisecond pos = audioPlayer->mSeek.mPos;
             if (SL_TIME_UNKNOWN != pos) {
-                position = pos;
+                //SL_LOGV("TIME UNKNOWN");
+                //position = pos;
             }
         }
 #endif
         interface_unlock_shared(this);
         *pMsec = position;
         result = SL_RESULT_SUCCESS;
+
+        //SL_LOGV("IPlay_GetPosition(%p, %p = %lu): %u", this, pMsec, *pMsec, result);
     }
 
     SL_LEAVE_INTERFACE
@@ -422,5 +444,8 @@ void IPlay_init(void *self)
     this->mLastSeekPosition = 0;
     this->mFramesSinceLastSeek = 0;
     this->mFramesSincePositionUpdate = 0;
+#endif
+#ifdef LSWTCS
+    this->mLastTick = 0;
 #endif
 }

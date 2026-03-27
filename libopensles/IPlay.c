@@ -444,6 +444,7 @@ void IPlay_init(void *self)
     this->mLastSeekPosition = 0;
     this->mFramesSinceLastSeek = 0;
     this->mFramesSincePositionUpdate = 0;
+    this->mHeadAtEndFired = SL_BOOLEAN_FALSE;
 #endif
 #ifdef LSWTCS
     this->mLastTick = 0;

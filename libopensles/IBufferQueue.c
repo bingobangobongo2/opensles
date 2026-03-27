@@ -42,6 +42,35 @@ static SLuint32 getAssociatedState(IBufferQueue *this)
     return state;
 }
 
+/** \brief Read one stereo frame from source buffer, handling mono→stereo and 8→16 conversion.
+ *  Returns left and right as int16 values via pointers.
+ */
+static void read_source_frame(const void *pBuffer, SLuint32 frameIndex,
+    int channels, int bps, int16_t *outL, int16_t *outR)
+{
+    if (bps == 8) {
+        const uint8_t *src = (const uint8_t *)pBuffer;
+        if (channels == 2) {
+            *outL = ((int16_t)src[frameIndex * 2]     - 0x80) << 8;
+            *outR = ((int16_t)src[frameIndex * 2 + 1] - 0x80) << 8;
+        } else {
+            int16_t s = ((int16_t)src[frameIndex] - 0x80) << 8;
+            *outL = s;
+            *outR = s;
+        }
+    } else {
+        const int16_t *src = (const int16_t *)pBuffer;
+        if (channels == 2) {
+            *outL = src[frameIndex * 2];
+            *outR = src[frameIndex * 2 + 1];
+        } else {
+            *outL = src[frameIndex];
+            *outR = *outL;
+        }
+    }
+}
+
+
 SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 size)
 {
     SL_ENTER_INTERFACE
@@ -61,85 +90,108 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
         if (newRear == this->mFront) {
             result = SL_RESULT_BUFFER_INSUFFICIENT;
         } else {
-            int num_cycles = 1;
-            int multiplier = 1;
-            if (this->samplerate > 0) {
-                num_cycles = (&_opensles_user_freq!=NULL?_opensles_user_freq:44100) * 1000 / this->samplerate;
-                if (num_cycles < 1) num_cycles = 1;
-                if (this->channels == 1)
-                    multiplier *= 2;
-                if (this->bps == 8)
-                    multiplier *= 2;
-            }
-
-            SLuint32 totalSize = size * num_cycles * multiplier;
-            void *copiedBuffer = calloc(1, totalSize);
-            if (copiedBuffer == NULL) {
-                result = SL_RESULT_MEMORY_FAILURE;
-            } else {
-                // Always copy into our own buffer to avoid race conditions
-                // with the mixer thread reading while the caller frees/reuses.
-                if (this->samplerate == 0) {
-                    // SndFile source: already in correct format, just copy
-                    memcpy(copiedBuffer, pBuffer, size);
-                } else if (this->bps != 8) {
-                    if (this->channels == 2) { // PCM16 Stereo
-                        if (num_cycles == 1) {
-                            memcpy(copiedBuffer, pBuffer, size);
-                        } else {
-                            uint32_t *src = (uint32_t *)pBuffer;
-                            uint32_t *dst = (uint32_t *)copiedBuffer;
-                            for (int j = 0; j < size; j += 4) {
-                                for (int i = 0; i < num_cycles; i++) {
-                                    dst[i] = *src;
-                                }
-                                src++;
-                                dst += num_cycles;
-                            }
-                        }
-                    } else { // PCM16 Mono -> Stereo
-                        uint16_t *src = (uint16_t *)pBuffer;
-                        uint16_t *dst = (uint16_t *)copiedBuffer;
-                        for (int j = 0; j < size; j += 2) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = *src;
-                                dst[i*2+1] = *src;
-                            }
-                            src++;
-                            dst += num_cycles * 2;
-                        }
-                    }
+            if (this->samplerate == 0) {
+                // SndFile source: already in correct format, just copy
+                void *copiedBuffer = calloc(1, size);
+                if (copiedBuffer == NULL) {
+                    result = SL_RESULT_MEMORY_FAILURE;
                 } else {
-                    if (this->channels == 2) { // PCM8 Stereo -> PCM16 Stereo
-                        uint8_t *src = (uint8_t *)pBuffer;
+                    memcpy(copiedBuffer, pBuffer, size);
+                    oldRear->mBuffer = copiedBuffer;
+                    oldRear->mSize = size;
+                    this->mRear = newRear;
+                    ++this->mState.count;
+#ifdef USE_OUTPUTMIXEXT
+                    if (SL_OBJECTID_AUDIOPLAYER == InterfaceToObjectID(this)) {
+                        CAudioPlayer *ap = (CAudioPlayer *) this->mThis;
+                        ap->mPlay.mHeadAtEndFired = SL_BOOLEAN_FALSE;
+                    }
+#endif
+                    result = SL_RESULT_SUCCESS;
+                }
+            } else {
+                // BufferQueue source: resample + convert to stereo 16-bit
+                uint32_t outRate = (&_opensles_user_freq != NULL) ? _opensles_user_freq : 44100;
+                uint32_t inRate = this->samplerate / 1000; // samplerate is in milliHz
+                int channels = this->channels;
+                int bps = this->bps;
+
+                // Calculate number of source frames
+                int bytesPerFrame = channels * (bps / 8);
+                SLuint32 srcFrames = size / bytesPerFrame;
+
+                if (srcFrames == 0) {
+                    result = SL_RESULT_PARAMETER_INVALID;
+                } else {
+                    // Calculate output frames using 64-bit to avoid overflow
+                    // outFrames = srcFrames * outRate / inRate
+                    SLuint32 outFrames;
+                    if (inRate == outRate) {
+                        outFrames = srcFrames;
+                    } else {
+                        outFrames = (SLuint32)(((uint64_t)srcFrames * outRate + inRate - 1) / inRate);
+                    }
+
+                    // Output is always stereo 16-bit: 4 bytes per frame
+                    SLuint32 totalSize = outFrames * 4;
+                    void *copiedBuffer = calloc(1, totalSize);
+                    if (copiedBuffer == NULL) {
+                        result = SL_RESULT_MEMORY_FAILURE;
+                    } else {
                         int16_t *dst = (int16_t *)copiedBuffer;
-                        for (int j = 0; j < size; j += 2) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = ((int16_t)src[0] - 0x80) << 8;
-                                dst[i*2+1] = ((int16_t)src[1] - 0x80) << 8;
+
+                        if (inRate == outRate && channels == 2 && bps == 16) {
+                            // Fast path: stereo 16-bit at native rate, just copy
+                            memcpy(copiedBuffer, pBuffer, size < totalSize ? size : totalSize);
+                        } else if (inRate == outRate) {
+                            // Same rate, just needs format conversion
+                            for (SLuint32 i = 0; i < srcFrames; i++) {
+                                int16_t l, r;
+                                read_source_frame(pBuffer, i, channels, bps, &l, &r);
+                                dst[i * 2]     = l;
+                                dst[i * 2 + 1] = r;
                             }
-                            src += 2;
-                            dst += num_cycles * 2;
-                        }
-                    } else { // PCM8 Mono -> PCM16 Stereo
-                        uint8_t *src = (uint8_t *)pBuffer;
-                        int16_t *dst = (int16_t *)copiedBuffer;
-                        for (int j = 0; j < size; j++) {
-                            for (int i = 0; i < num_cycles; i++) {
-                                dst[i*2] = ((int16_t)*src - 0x80) << 8;
-                                dst[i*2+1] = ((int16_t)*src - 0x80) << 8;
+                        } else {
+                            // Linear interpolation resampler using fixed-point
+                            // position accumulator (32.32 format)
+                            uint64_t step = ((uint64_t)inRate << 32) / outRate;
+                            uint64_t pos = 0;
+
+                            for (SLuint32 i = 0; i < outFrames; i++) {
+                                uint32_t idx = (uint32_t)(pos >> 32);
+                                uint32_t frac = (uint32_t)(pos & 0xFFFFFFFF);
+
+                                // Clamp index to valid range
+                                if (idx >= srcFrames) idx = srcFrames - 1;
+                                uint32_t idx1 = (idx + 1 < srcFrames) ? idx + 1 : idx;
+
+                                int16_t l0, r0, l1, r1;
+                                read_source_frame(pBuffer, idx, channels, bps, &l0, &r0);
+                                read_source_frame(pBuffer, idx1, channels, bps, &l1, &r1);
+
+                                // Linear interpolation: out = s0 + (s1 - s0) * frac
+                                // frac is 0..0xFFFFFFFF representing 0.0..1.0
+                                int32_t f = frac >> 16; // reduce to 16-bit fraction for mul
+                                dst[i * 2]     = (int16_t)(l0 + (((l1 - l0) * f) >> 16));
+                                dst[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * f) >> 16));
+
+                                pos += step;
                             }
-                            src++;
-                            dst += num_cycles * 2;
                         }
+
+                        oldRear->mBuffer = copiedBuffer;
+                        oldRear->mSize = totalSize;
+                        this->mRear = newRear;
+                        ++this->mState.count;
+#ifdef USE_OUTPUTMIXEXT
+                        if (SL_OBJECTID_AUDIOPLAYER == InterfaceToObjectID(this)) {
+                            CAudioPlayer *ap = (CAudioPlayer *) this->mThis;
+                            ap->mPlay.mHeadAtEndFired = SL_BOOLEAN_FALSE;
+                        }
+#endif
+                        result = SL_RESULT_SUCCESS;
                     }
                 }
-
-                oldRear->mBuffer = copiedBuffer;
-                oldRear->mSize = totalSize;
-                this->mRear = newRear;
-                ++this->mState.count;
-                result = SL_RESULT_SUCCESS;
             }
         }
         // set enqueue attribute if state is PLAYING and the first buffer is enqueued

@@ -224,8 +224,10 @@ typedef struct {
 
 #ifdef USE_SNDFILE
 
-#define SndFile_BUFSIZE 512     // output buffer size in bytes (also SndFile read size in shorts)
-#define SndFile_NUMBUFS 2       // number of output/SndFile double-buffers
+#define SndFile_BUFSIZE 2048    // output buffer size in bytes (also SndFile read size in shorts)
+                                //   512 stereo frames @ 44.1kHz = ~11.6ms latency
+                                //   (was 512 = ~2.9ms, too tight for file I/O in mixer thread)
+#define SndFile_NUMBUFS 4       // number of output/SndFile buffers (was 2, more headroom for I/O)
 
 struct SndFile {
     // save URI also?
@@ -728,6 +730,7 @@ typedef struct Play_interface {
     SLmillisecond mLastSeekPosition;     // Last known accurate position, set at Seek
     SLuint32 mFramesSinceLastSeek;       // Frames mixed since last known accurate position
     SLuint32 mFramesSincePositionUpdate; // Frames mixed since last position update callback
+    SLboolean mHeadAtEndFired;           // Prevents re-firing HEADATEND until new buffer enqueued
 #endif
 #ifdef LSWTCS
     SceUInt32 mLastTick;

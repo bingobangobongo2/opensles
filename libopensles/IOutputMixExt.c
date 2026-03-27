@@ -137,13 +137,15 @@ static SLboolean track_check(Track *track)
             // ignoring later distance-based volume changes.
             track->mGains[0] = audioPlayer->mGains[0];
             track->mGains[1] = audioPlayer->mGains[1];
-            // SFX (non-SndFile) tracks get -26dB reduction.
+#ifdef LSWTCS
+            // LSWTCS-specific: SFX (non-SndFile) tracks get -26dB reduction.
             // At 0.1f (-20dB), 10 NPC footsteps summed to ~music volume.
             // 0.05f gives more headroom for many simultaneous SFX.
             if (audioPlayer->mSndFile.mSNDFILE == NULL) {
                 track->mGains[0] *= 0.05f;
                 track->mGains[1] *= 0.05f;
             }
+#endif
 
             if (0 < track->mAvail) {
                 trackHasData = SL_BOOLEAN_TRUE;
@@ -160,17 +162,17 @@ static SLboolean track_check(Track *track)
                 audioPlayer->mPlay.mState = SL_PLAYSTATE_PLAYING;
                 trackHasData = SL_BOOLEAN_TRUE;
             } else {
-                // No buffers on queue — fire HEAD_AT_END callback for SFX
-                // (non-SndFile) players so the game's voice lifecycle can
-                // release the AudioPlayer slot for reuse.
+                // No buffers on queue — fire HEAD_AT_END callback so the
+                // game's voice lifecycle can release the AudioPlayer slot.
+                // Only fire once per empty-queue state; reset when new
+                // buffer is enqueued (via ATTR_ENQUEUE / track_check).
                 if (audioPlayer->mSndFile.mSNDFILE == NULL) {
-                    if (audioPlayer->mPlay.mEventFlags & SL_PLAYEVENT_HEADATEND) {
+                    if ((audioPlayer->mPlay.mEventFlags & SL_PLAYEVENT_HEADATEND) &&
+                        !audioPlayer->mPlay.mHeadAtEndFired) {
+                        audioPlayer->mPlay.mHeadAtEndFired = SL_BOOLEAN_TRUE;
                         slPlayCallback cb = audioPlayer->mPlay.mCallback;
                         void *ctx = audioPlayer->mPlay.mContext;
-                        // Clear event flags so callback fires only once
-                        audioPlayer->mPlay.mEventFlags = 0;
                         if (NULL != cb) {
-                            // Unlock before callback to avoid deadlock with game thread
                             object_unlock_exclusive(&audioPlayer->mObject);
                             (*cb)(&audioPlayer->mPlay.mItf, ctx, SL_PLAYEVENT_HEADATEND);
                             object_lock_exclusive(&audioPlayer->mObject);
